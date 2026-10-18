@@ -96,6 +96,8 @@ export interface TrayClick {
   y?: number
   /** Windows tray left click: the status panel closes by itself unless the cursor stays on it (#41). */
   autoClose?: boolean
+  /** Windows: the tray made the native window focusable for this panel. */
+  focusTaken?: boolean
 }
 
 /** Data only; menu actions stay in the renderer. */
