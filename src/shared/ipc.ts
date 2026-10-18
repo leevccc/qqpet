@@ -1,5 +1,6 @@
 import type { ShapeRect } from './hit-shape'
 import type { LanPeer } from './lan'
+import type { WebhookMsg } from './webhook'
 import type { SaveData, SavePatch, Sex } from './save'
 
 export const IPC = {
@@ -45,6 +46,8 @@ export const IPC = {
   lanOnline: 'lan:online',
   lanOffline: 'lan:offline',
   lanMessage: 'lan:message',
+  webhook: 'webhook:message',
+  webhookState: 'webhook:state',
   lanSend: 'lan:send',
   lanPeers: 'lan:peers',
   memLoad: 'mem:load',
@@ -96,6 +99,8 @@ export interface TrayClick {
   y?: number
   /** Windows tray left click: the status panel closes by itself unless the cursor stays on it (#41). */
   autoClose?: boolean
+  /** Windows: the tray made the native window focusable for this panel. */
+  focusTaken?: boolean
 }
 
 /** Data only; menu actions stay in the renderer. */
@@ -270,6 +275,10 @@ export interface QQPetApi {
   onLanOffline?(listener: (peer: LanPeer) => void): void
   /** A message body from a linked pet (visits and deliveries ride on this). */
   onLanMessage?(listener: (fromId: string, body: unknown) => void): void
+  /** An external service called the local webhook. Absent off the desktop. */
+  onWebhook?(listener: (m: WebhookMsg) => void): void
+  /** Whether the webhook is listening; `error` says why not (port taken, ...). */
+  webhookState?(): Promise<{ running: boolean; error?: string }>
   /** Sends to one pet; a `visit` to an offline pet is queued and returns 'queued'. */
   lanSend?(toId: string, body: unknown): Promise<'sent' | 'queued'>
   /** Peers already online; events fired before the renderer loaded are missed otherwise. */

@@ -26,6 +26,43 @@ type Option = { label: string; title?: string } & (
   | { type: 'input'; value: () => string; set: (v: string) => void }
 )
 
+function webhookUrl(): string {
+  return `http://127.0.0.1:${save.settings.webhookPort}/hook?token=${save.settings.webhookToken}`
+}
+
+function toggleWebhook(): void {
+  const s = save.settings
+  if (s.webhook) return update('settings', { webhook: false })
+  update('settings', { webhook: true, webhookToken: s.webhookToken || crypto.randomUUID().replace(/-/g, '') })
+  // The server binds a moment later; say so when the port is taken.
+  window.setTimeout(() => {
+    void window.qqpet.webhookState?.().then((r) => {
+      if (r.error) windowView({ title: 'Webhook', msg: `启动失败：${r.error}，请换一个端口。` })
+    })
+  }, 600)
+}
+
+function webhookOptions(): Option[] {
+  const s = save.settings
+  const copy = (text: string, done: string): void => void navigator.clipboard.writeText(text).then(() => windowView({ title: 'Webhook', msg: done }))
+  const opts: Option[] = [
+    {
+      type: 'radio',
+      label: 'Webhook：接收外部消息（默认关）',
+      title: '在本机 127.0.0.1 开一个 HTTP 接口，外部服务 POST 过来的消息会由宠物念出来，可带链接，点「打开链接」跳转。仅本机可访问，必须带 token；免打扰时不弹。',
+      on: () => s.webhook,
+      run: toggleWebhook,
+    },
+  ]
+  if (!s.webhook) return opts
+  return [
+    ...opts,
+    { type: 'input', label: 'Webhook 端口（1024-65535，改后立即生效）', value: () => String(s.webhookPort), set: (v) => { const n = Math.trunc(Number(v)); if (n >= 1024 && n <= 65535) update('settings', { webhookPort: n }) } },
+    { type: 'button', label: '复制 Webhook 地址', title: webhookUrl(), run: () => copy(webhookUrl(), '地址已复制。POST JSON：{"text":"内容","title":"标题","url":"https://…","duration":30}，duration 为停留秒数（0=点击前一直显示）。') },
+    { type: 'button', label: '重置 Webhook token', title: '旧地址立即失效', run: () => { update('settings', { webhookToken: crypto.randomUUID().replace(/-/g, '') }); windowView({ title: 'Webhook', msg: 'token 已重置，请重新复制地址。' }) } },
+  ]
+}
+
 function setOpacity(v: number): void {
   const o = Math.round(Math.min(Math.max(v, 0.1), 1) * 10) / 10
   update('settings', { opacity: o })
@@ -259,6 +296,13 @@ const TABS: { label: string; options: Option[] }[] = [
           run: () => setFaceClick(s.faceClick ? 0 : 1),
         },
         { type: 'radio', label: '是否开启互动动作指示器', title: FACE_TIP, on: () => s.faceClick === 2, run: () => setFaceClick(s.faceClick === 2 ? 1 : 2) },
+        {
+          type: 'radio',
+          label: '标准难度（元宝收入降为 40%，默认关=轻松）',
+          title: '轻松：保持现有的元宝收入；标准：打工、小游戏、钓鱼、农场、邮件礼物等收入只有 40%（至少 1），物价不变。作弊获得的不受影响。',
+          on: () => s.difficulty === 'standard',
+          run: () => update('settings', { difficulty: s.difficulty === 'standard' ? 'easy' : 'standard' }),
+        },
         { type: 'radio', label: '开启免打扰模式', on: () => s.quiet, run: () => update('settings', { quiet: !s.quiet }) },
         {
           type: 'radio',
@@ -275,6 +319,7 @@ const TABS: { label: string; options: Option[] }[] = [
           on: () => s.lan,
           run: () => update('settings', { lan: !s.lan }),
         },
+        ...(window.qqpet.onWebhook ? webhookOptions() : []),
         {
           type: 'radio',
           label: '语音对话',
