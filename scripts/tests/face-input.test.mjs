@@ -66,6 +66,7 @@ function faceFixture({ stage = 'Egg', sex = 'GG', touch = true, faceClick = 2, p
       div: className => Object.assign(new Element(), { className }),
       clearFacePoints: () => face.clearFacePoints(),
       showFacePoints: () => face.showFacePoints(),
+      showFacePointsAfterClick: () => face.showFacePointsAfterClick(),
     },
   })
   Object.assign(app.info, { sex, mood })
@@ -87,7 +88,7 @@ function faceFixture({ stage = 'Egg', sex = 'GG', touch = true, faceClick = 2, p
     clearTimeout: id => timers.delete(id),
   }
   const source = stripTypeScriptTypes(faceSource).replace(/^import .*$/gm, '').replace(/^export /gm, '')
-  runInNewContext(source + '\nthis.face = { showFacePoints, clearFacePoints }', scope)
+  runInNewContext(source + '\nthis.face = { showFacePoints, showFacePointsAfterClick, clearFacePoints }', scope)
   face = scope.face
   const layer = pet.children.find(child => child.className === 'face')
   const native = (phase, x = 550, y = 340) => app.nativeInput({ phase, id: 1, x, y })
@@ -197,5 +198,14 @@ test('desktop hover still waits 300ms and leaving cancels or clears the points',
   f.advance(300)
   assert.equal(f.points().length, 0)
   f.tap('dom')
-  assert.equal(f.points().length, 0, 'a desktop tap does not replace hover with touch behavior')
+  assert.equal(f.points().length, 4, 'a desktop click on the pet brings the spots back for the next click (#113)')
+})
+
+test('a desktop click that did not lift brings back the hover points it hid (#113)', () => {
+  const f = faceFixture({ touch: false })
+  f.pet.dispatchEvent(new Event('pointerenter'))
+  f.advance(300)
+  assert.equal(f.points().length, 4)
+  f.tap('dom')
+  assert.equal(f.points().length, 4, 'still hovering: the spots return for the next click')
 })
