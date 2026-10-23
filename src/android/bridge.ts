@@ -14,6 +14,7 @@ import { applyPatch, buried, petOf, startSave } from '../shared/save-logic'
 import { TRAY_STATES, trayTip } from '../shared/tray'
 import { latestRelease } from '../shared/update'
 import { weather } from '../shared/weather'
+import { webdavApi, touchWebdavProgress } from '../shared/webdav-host'
 
 /** The `QQPetNative` JavaScript interface of PetService. Async calls answer through `__qqpet.resolve(id, value, error)`. */
 interface Native {
@@ -36,6 +37,8 @@ interface Native {
   setAutoStart(on: boolean): void
   /** The notification standing in for the tray: an icon under pet/img_res/Tray/, and its text unless null. */
   setTray(icon: string, tip: string | null): void
+  /** The pet is hidden: the notification offers 显示宠物. Absent on older shells. */
+  setHidden?(on: boolean): void
   /** The overlay window's rectangle, in CSS pixels of a page `viewport` pixels wide. */
   setBounds(x: number, y: number, w: number, h: number, viewport: number): void
   /** "left,top,right,bottom" of the system bars and cutout, in CSS pixels of a page `viewport` pixels wide. */
@@ -64,6 +67,9 @@ declare global {
 }
 
 const native = window.QQPetNative
+// The real frame clock: the SWF player holds page animation frames while the host is paused (#119), and the window
+// must still follow a menu or panel opened from the notification while the pet is hidden.
+const frame = window.requestAnimationFrame.bind(window)
 
 const pending = new Map<number, { resolve: (v: string | null) => void; reject: (e: Error) => void }>()
 let seq = 0
@@ -164,10 +170,32 @@ for (const type of ['pointerup', 'pointercancel'] as const)
   )
 
 let bounds = { x: 0, y: 0, w: 0, h: 0 }
-function track(): void {
-  requestAnimationFrame(track)
+// Measuring every element each frame kept the phone busy while nothing changed (#119): right after a touch or a
+// window change the window follows every frame, otherwise a few times a second (a bubble or an animation that
+// outgrows the window catches up within IDLE_MS).
+const BUSY_MS = 2000
+const IDLE_MS = 200
+const PAUSED_MS = 1000
+let busyUntil = 0
+let measured = 0
+for (const type of ['pointerdown', 'pointermove', 'pointerup'] as const) document.addEventListener(type, () => (busyUntil = performance.now() + BUSY_MS), true)
+// A bubble, menu or panel appearing changes the page: the window follows it in the next frame, not IDLE_MS later.
+// The notification offers 显示宠物 while the pet is hidden.
+let hiddenSent: boolean | undefined
+const sendHidden = (): void => {
+  const on = document.body.classList.contains('petHidden')
+  if (on !== hiddenSent) native.setHidden?.((hiddenSent = on))
+}
+new MutationObserver(sendHidden).observe(document.body, { attributes: true, attributeFilter: ['class'] })
+sendHidden()
+new MutationObserver(() => (busyUntil = performance.now() + BUSY_MS)).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'style', 'hidden'] })
+function track(now: number): void {
+  frame(track)
   // A resize under a resting finger skews the next events (a long press reads as a drag); it waits for the lift.
   if (press && !dragging) return
+  // Paused (pet hidden, or the owner away) the page rarely changes: measure seldom, but at once after a change.
+  if (!dragging && now >= busyUntil && now - measured < (window.__qqpetHostPaused ? PAUSED_MS : IDLE_MS)) return
+  measured = now
   let x = innerWidth
   let y = innerHeight
   let r = 0
@@ -183,10 +211,13 @@ function track(): void {
       b = Math.max(b, box.bottom)
     }
   const next = nextBounds(bounds, r > x && b > y ? { left: x, top: y, right: r, bottom: b } : null, innerWidth, innerHeight)
-  if (next.x !== bounds.x || next.y !== bounds.y || next.w !== bounds.w || next.h !== bounds.h) native.setBounds(next.x, next.y, next.w, next.h, innerWidth)
+  if (next.x !== bounds.x || next.y !== bounds.y || next.w !== bounds.w || next.h !== bounds.h) {
+    native.setBounds(next.x, next.y, next.w, next.h, innerWidth)
+    busyUntil = now + BUSY_MS
+  }
   bounds = next
 }
-requestAnimationFrame(track)
+frame(track)
 
 // The page spans the whole screen, under the status and navigation bars; frames keep clear of them (box.ts).
 function safeArea(): void {
@@ -217,6 +248,20 @@ const api: QQPetApi = {
     applyPatch(save, cloneJson(patch))
     write()
     if (patch.petInfo) showTray()
+    if (
+      patch.petInfo ||
+      patch.selfGoodDatas ||
+      patch.selfGoodUseOption ||
+      patch.studyInfo ||
+      patch.gameSaveDatas ||
+      patch.saveJsonData ||
+      patch.activeOption ||
+      patch.petComputedlInfo ||
+      patch.havePet !== undefined ||
+      patch.illustrated
+    ) {
+      touchWebdavProgress({ getSave: () => save, patchSave: (p) => { applyPatch(save, cloneJson(p)); write() } })
+    }
   },
   resetPet(sex) {
     save = buried(save, sex)
@@ -266,7 +311,40 @@ const api: QQPetApi = {
   onFront() {},
 }
 
+
+const webdav = webdavApi({
+  fetch: nativeFetch,
+  getSave: () => save,
+  patchSave: (patch) => {
+    applyPatch(save, cloneJson(patch))
+    write()
+  },
+  replaceSave: (next) => {
+    native.write(`${FILE}.bak`, JSON.stringify(save))
+    save = startSave(JSON.parse(JSON.stringify(next)) as Record<string, unknown>)
+    write()
+  },
+  readFile: (name, fallback) => native.read(name) ?? fallback,
+  writeFile: (name, text) => native.write(name, text),
+  ensureDeviceId: () => {
+    if (save.settings.webdavDeviceId) return save.settings.webdavDeviceId
+    const id = crypto.randomUUID()
+    applyPatch(save, { settings: { webdavDeviceId: id } })
+    write()
+    return id
+  },
+  relaunch,
+})
+
+Object.assign(api, webdav)
+
 window.qqpet = api
+if (save.settings.webdav && save.settings.webdavAuto && save.settings.webdavUrl.trim()) {
+  void api.webdavSync?.().then((r) => {
+    if (r && r.ok) console.log("[webdav]", r.message)
+    else if (r && !r.ok) console.error("[webdav]", r.error)
+  })
+}
 
 // Ruffle's "复制错误详情" calls navigator.clipboard.writeText and ticks without waiting for it; the overlay
 // WebView is not focused, so the web clipboard refuses and nothing is copied (#18). Copy natively instead.

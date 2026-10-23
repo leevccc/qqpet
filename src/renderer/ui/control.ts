@@ -2,9 +2,12 @@ import { describe, type Good, type GoodType } from '../pet/data/goods'
 import { toolbarScaleFor } from '../../shared/layout'
 import { listGoods, onGoodsChange, pageOf, type Page } from '../pet/goods'
 import { doctor, useItem } from '../pet/items'
-import { describeStudy, describeWork, study, studyGoods, work, workGoods } from '../pet/jobs'
+import { describeStudy, describeWork, study, studyGoods, studyLessons, work, workGoods } from '../pet/jobs'
 import { info, onInfoChange, petSize, save } from '../pet/store'
+import { viewportSize } from './viewport'
 import './css/control.css'
+import { cardBadge } from './card-badge'
+import { progressMark } from './progress-mark'
 import { button, div, img, touch } from './dom'
 import { openCommunity } from './community'
 import { openEmail } from './email'
@@ -45,6 +48,10 @@ interface Panel {
   /** Everyday panels: the inventory type shown, with the bar of the stat it restores and a shop link. */
   type?: GoodType
   stat?: Stat
+  /** Bottom-right cue (study 4/9, bag count). Omit when there is no clear number. */
+  mark?: (g: Good) => string | null | undefined
+  /** Top-left label on the card face (study subject names). */
+  tag?: (g: Good) => string | null | undefined
 }
 
 interface Entry {
@@ -66,6 +73,8 @@ const inventory = (type: GoodType, icon: number, stat: Stat) => (): void =>
     },
     type,
     stat,
+    // Classic corner count on bag cards (not a fraction; still the same cue).
+    mark: (g) => (g.num != null && g.num > 0 ? String(g.num) : null),
   })
 
 const PANELS = {
@@ -99,7 +108,15 @@ const MENU: { name: string; icon: string; children?: Entry[]; run?: () => void }
       {
         name: '学习',
         icon: 'xuexi.png',
-        run: () => openPanel({ icon: activeIcon(24), list: (page) => pageOf(studyGoods(), page, PAGE), lines: describeStudy, use: study }),
+        run: () =>
+          openPanel({
+            icon: activeIcon(24),
+            list: (page) => pageOf(studyGoods(), page, PAGE),
+            lines: describeStudy,
+            use: study,
+            tag: (g) => g.name || null,
+            mark: (g) => progressMark(studyLessons(g), g.classNum ?? 0),
+          }),
       },
       { name: '旅游', icon: 'lvyou.png', run: openTravel },
       { name: '看病', icon: 'zhibing.png', run: doctor },
@@ -139,21 +156,59 @@ let introTimer = 0
 let open: (Panel & { page: number }) | null = null
 
 /**
+ * Visible page box the bar must stay inside. Desktop uses the overlay size; when Android zooms the
+ * layout viewport above what is shown, prefer the visual viewport so the panel is not clipped (#124 #103).
+ */
+function screenBox(): { left: number; top: number; width: number; height: number } {
+  const base = touch ? { width: innerWidth, height: innerHeight } : viewportSize()
+  const vv = window.visualViewport
+  if (vv && vv.scale > 1.01) {
+    return {
+      left: vv.offsetLeft,
+      top: vv.offsetTop,
+      width: Math.min(vv.width, base.width),
+      height: Math.min(vv.height, base.height),
+    }
+  }
+  return { left: 0, top: 0, width: base.width, height: base.height }
+}
+
+/**
  * Centered under the pet's feet; when there is no room below, mirrored above its head. Kept on screen.
  * Native iPads use the original toolbar size; other touch hosts grow it with the pet.
  */
 function place(): void {
   const size = petSize()
-  const scale = toolbarScaleFor(size, (innerWidth - 2 * EDGE) / BAR_WIDTH, touch, window.qqpet.deviceKind)
+  const box = screenBox()
+  const scale = toolbarScaleFor(size, (box.width - 2 * EDGE) / BAR_WIDTH, touch, window.qqpet.deviceKind)
   const height = BAR_HEIGHT * scale
   const half = (BAR_WIDTH * scale) / 2 + EDGE
   const feet = info.lastY + size * FEET
-  const onTop = feet > innerHeight - EDGE - height
+  const onTop = feet > box.top + box.height - EDGE - height
   control.classList.toggle('up', onTop)
-  control.style.left = `${Math.min(Math.max(info.lastX + size / 2, half), innerWidth - half)}px`
+  // Prefer the pet's center, then clamp so the 314px goods panel (scaled) stays fully visible (#124).
+  const center = Math.min(Math.max(info.lastX + size / 2, box.left + half), box.left + box.width - half)
+  control.style.left = `${center}px`
   control.style.top = `${onTop ? info.lastY + size * HEAD : feet}px`
   control.style.transform = `scale(${scale})`
   setBubbleLift(shown && onTop ? Math.max(height - size * HEAD, 0) : 0)
+  // Tooltips and submenus can still stick out: nudge after layout if children overflow the visible box.
+  requestAnimationFrame(() => {
+    if (!shown) return
+    let minL = center
+    let maxR = center
+    for (const child of control.children) {
+      const r = (child as HTMLElement).getBoundingClientRect()
+      if (r.width <= 0 && r.height <= 0) continue
+      minL = Math.min(minL, r.left)
+      maxR = Math.max(maxR, r.right)
+    }
+    let shift = 0
+    if (maxR > box.left + box.width - EDGE) shift = box.left + box.width - EDGE - maxR
+    if (minL + shift < box.left + EDGE) shift = box.left + EDGE - minL
+    if (shift) control.style.left = `${center + shift}px`
+    control.classList.toggle('nearRight', center + shift > box.left + box.width / 2)
+  })
 }
 
 /** A tap leaves its menu hovered, children shown: on touch the bar goes once a child is picked, unless it opened a goods panel. */
@@ -227,17 +282,24 @@ function hide(): void {
 }
 
 let list: HTMLElement | null = null
+/** The stat bar of the open panel, updated in place so a tick does not rebuild the goods under a finger. */
+let bar: HTMLElement | null = null
+/** The good a touch already previewed; it survives rebuilds of the same panel (a count change, a page turn). */
+let picked: string | null = null
 
 function openPanel(p: Panel, page = 1): void {
+  if (open?.type !== p.type || open?.icon !== p.icon) picked = null
   open = { ...p, page }
+  bar = null
   menus.style.display = 'none'
   const { list: goods, totalPage } = p.list(page)
   const turn = (d: number) => (): void => {
     if (page + d >= 1 && page + d <= totalPage) openPanel(p, page + d)
   }
-  let picked: Good | null = null
-  const items = goods.map((g: Good) =>
-    div(
+  const items = goods.map((g: Good) => {
+    const tag = p.tag?.(g)
+    const mark = p.mark?.(g)
+    return div(
       'goodItem',
       div(
         'goodItemIconBox fcc',
@@ -245,13 +307,16 @@ function openPanel(p: Panel, page = 1): void {
         Object.assign(img('goodItemIcon', g.url), {
           onclick: () => {
             // A tap hovers what it touches: the first one shows the good's info, the next uses it.
-            if (touch && picked !== g) return void (picked = g)
+            if (touch && picked !== g.id) return void (picked = g.id)
+            picked = null
             if (p.use(g)) closePanel()
           },
         }),
+        ...(tag ? [cardBadge(tag, 'tl')] : []),
+        ...(mark ? [cardBadge(mark, 'br')] : []),
       ),
-    ),
-  )
+    )
+  })
   const next = div(
     'goodList focusPress',
     img('goodTypeIcon', p.icon),
@@ -263,7 +328,7 @@ function openPanel(p: Panel, page = 1): void {
       div(
         'goods f1 fC h100',
         div('fc f1', ...(items.length ? items : [div('goodsNone tc w100', ' 空空如也~~ ')])),
-        ...(p.stat ? [div('progress', progress(info[p.stat], save.petComputedlInfo[`${p.stat}Max`]))] : []),
+        ...(p.stat ? [(bar = div('progress', progress(info[p.stat], save.petComputedlInfo[`${p.stat}Max`])))] : []),
       ),
       button('toRight', turn(1)),
     ),
@@ -271,19 +336,27 @@ function openPanel(p: Panel, page = 1): void {
   if (list) list.replaceWith(next)
   else control.appendChild(next)
   list = next
+  place()
 }
 
 function closePanel(): void {
   open = null
   list?.remove()
   list = null
+  bar = null
+  picked = null
   menus.style.display = ''
   scheduleHide()
 }
 
 onInfoChange((key) => {
   if (key === 'lastX' || key === 'lastY' || key === 'growth') place()
-  if (open && key === open.stat) openPanel(open, open.page)
+  // 只换进度条：整块重建会丢掉手指刚点过的预览，第二下又变成预览，物品用不出去
+  if (open?.stat && key === open.stat && bar) {
+    const next = div('progress', progress(info[open.stat], save.petComputedlInfo[`${open.stat}Max`]))
+    bar.replaceWith(next)
+    bar = next
+  }
 })
 onGoodsChange((type) => {
   if (open?.type === type) openPanel(open, Math.min(open.page, Math.max(open.list(1).totalPage, 1)))

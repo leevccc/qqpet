@@ -21,7 +21,7 @@ export class Native {
   static readonly METHODS: string[] = [
     'read', 'write', 'http', 'exportSave', 'importSave',
     'openGame', 'quit', 'copyText', 'openUrl', 'setFocusable', 'setAutoStart',
-    'setTray', 'setBounds', 'safeArea'
+    'setTray', 'setHidden', 'setBounds', 'safeArea'
   ]
 
   read(name: string): string {
@@ -54,8 +54,13 @@ export class Native {
       }
     } catch (_e) {
     }
+    let verb = http.RequestMethod.GET
+    if (method === 'POST') verb = http.RequestMethod.POST
+    else if (method === 'PUT') verb = http.RequestMethod.PUT
+    else if (method === 'DELETE') verb = http.RequestMethod.DELETE
+    // MKCOL / PROPFIND are not in the ArkHTTP enum; GET fallback lets ensureCollection soft-fail.
     const opts: http.HttpRequestOptions = {
-      method: method === 'POST' ? http.RequestMethod.POST : http.RequestMethod.GET,
+      method: verb,
       header: extra,
       connectTimeout: 60000,
       readTimeout: 60000
@@ -140,6 +145,10 @@ export class Native {
 
   setTray(icon: string, tip: string): void {
     host().setTray(icon, tip === 'null' ? '' : tip)
+  }
+
+  setHidden(on: boolean | string | number): void {
+    host().setHidden(flag(on))
   }
 
   setBounds(rect: string): void {

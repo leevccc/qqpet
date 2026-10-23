@@ -1,4 +1,5 @@
 import { PetSwf } from '../swf/pet-swf'
+import { setBackgroundPeeking } from '../ui/background'
 import { openEmail } from '../ui/email'
 import { floatMood } from '../ui/float'
 import { say } from '../ui/talk'
@@ -6,13 +7,16 @@ import { emitSaid } from './said'
 import { DEAD, illOf } from './data/ills'
 import { TALK, type Line } from './data/talk'
 import { advanceTask, stopTask } from './activity'
-import { pickCare } from './care'
+import { chooseCare } from './care'
+import { care, tickCustody } from './custody'
+import { careTick, logCare, restock } from './sweetcare'
 import { IDLE, rephrase } from './ai'
 import { dateTalk, festival, greeting, loadCalendar } from './calendar'
 import { listGoods, tickTimed } from './goods'
 import { doctor, useItem, useItemQuietly } from './items'
 import { deliverMails } from './mail'
 import { Machine, type Pose } from './machine'
+import { moodDecayPerMinute } from './mood'
 import { rand } from './rand'
 import { lookUrl, restPlan, SINGLE_FRAME_HOLD, walkUrl } from './router'
 import {
@@ -37,7 +41,6 @@ import {
   syncLevel,
   update,
 } from './store'
-import { resetFish } from './fishing'
 import { harvestNews } from './harvest'
 import { resetSignIn, tickGift } from './signin'
 import { resetTasks, rollDaily } from './tasks'
@@ -60,6 +63,9 @@ export const machine = new Machine(petSwf, (over, next) => {
   }
   over.e?.()
   next.s?.()
+  const wasPeek = over.a === 'hideleft' || over.a === 'hideright'
+  const nowPeek = next.a === 'hideleft' || next.a === 'hideright'
+  if (wasPeek !== nowPeek) setBackgroundPeeking(nowPeek)
 })
 
 /** Answering the pet's small talk cheers it up. */
@@ -235,7 +241,10 @@ interface Say {
 }
 
 /** Shows a bubble, optionally together with an action that it waits for. Do-not-disturb drops only the bubble, never one whose button the caller waits for. */
-export function speak(t: Say, action?: string, hooks: { start?: () => void; end?: () => void; ok?: () => void } = {}): void {
+/** How long a pinned bubble (`wait`) stays up. */
+const WAIT_MS = 180_000
+
+export function speak(t: Say, action?: string, hooks: { start?: () => void; end?: () => void; ok?: () => void; wait?: boolean } = {}): void {
   let text = t.s ?? ''
   let button = t.b ?? '好的'
   if (t.c) {
@@ -253,7 +262,8 @@ export function speak(t: Say, action?: string, hooks: { start?: () => void; end?
       const blurt = (s: string): void => {
         // 入账的是它真正说出口的那句
         emitSaid(s)
-        void say(s, [button], onOk)
+        // 钉住的气泡（如「我要考试」）是唯一入口：留 3 分钟、不被别的气泡顶掉，直到被点掉
+        void say(s, [button], onOk, hooks.wait ? WAIT_MS : undefined, hooks.wait)
       }
       if (!polish) blurt(text)
       else void rephrase(text, t.ai || undefined).then((s) => blurt(s ?? text))
@@ -333,6 +343,17 @@ function healthChanged(prev: number): void {
 /** Last accounted time; null makes the next tick only start the clock (start-up, or after a pause). */
 let lastTick: number | null = null
 
+/** 作弊: stats don't decay. */
+export const frozen = (): boolean => save.saveJsonData.freeze === '1'
+export const setFrozen = (on: boolean): void => update('saveJsonData', { freeze: on ? '1' : '0' })
+
+/** 作弊: lets `minutes` of growth time pass at once (activities, decay, 贴心宝贝 included). */
+export function skipTime(minutes: number): void {
+  if (lastTick === null) return
+  lastTick -= Math.max(0, Math.min(minutes, 2880)) * 60
+  tick()
+}
+
 const MOOD_OUT = { work: 'stopWorkFoMood0', study: 'stopStudyFoMood0', trip: 'overTripUpFoMood0' }
 
 /** Per-minute accounting: online time, stat decay and growth for the elapsed minutes. */
@@ -344,7 +365,6 @@ function tick(): void {
     newDay(today)
     resetTasks()
     resetSignIn()
-    resetFish()
     void daily()
   }
   if (lastTick !== null) {
@@ -359,22 +379,27 @@ function tick(): void {
     for (let i = 0; i < steps; i++) {
       // Work, study and travel wear the pet out faster.
       const extra = busy() ? 1 : 0
-      const moodRate = rand(1, 2) + extra
+      const moodRate = moodDecayPerMinute(Boolean(extra))
       // Growth only counts the minutes the mood lasted; an activity stops when it runs out.
       const g = Math.min(dt, info.mood / moodRate)
       if (g < dt) {
         const stopped = stopTask()
         if (stopped) speak({ c: 'state', s: MOOD_OUT[stopped], now: true }, 'speak')
       }
-      setInfo('mood', Math.max(info.mood - moodRate * dt, 0))
-      setInfo('hunger', Math.max(info.hunger - (rand(2, 3) + extra) * dt, 0))
-      setInfo('clean', Math.max(info.clean - (rand(2, 3) + extra) * dt, 0))
+      // 作弊「冻结状态」: hunger, cleanliness and mood stay put.
+      if (!frozen()) {
+        setInfo('mood', Math.max(info.mood - moodRate * dt, 0))
+        setInfo('hunger', Math.max(info.hunger - (rand(2, 3) + extra) * dt, 0))
+        setInfo('clean', Math.max(info.clean - (rand(2, 3) + extra) * dt, 0))
+      }
       addInfo('growth', +(growthPerMinute() * g).toFixed(8))
       grown += g
       if (info.sweetHeart) selfCare(i < steps - 1)
     }
     for (const type of tickTimed(grown)) speak({ c: 'state', s: `${type}Over`, now: true }, 'speak')
     advanceTask(grown)
+    tickCustody()
+    careTick()
   }
   lastTick = now
   update('nowTimeLine', now)
@@ -389,11 +414,15 @@ const NEEDS = [
 
 /** Sweetheart: the pet tends its first low need it has a good for, with the good that wastes least (#40). */
 function selfCare(quiet = false): void {
+  const cfg = care()
+  if (!cfg.on) return
   for (const need of NEEDS) {
     const max = save.petComputedlInfo[`${need.stat}Max`]
-    if (info[need.stat] / max >= 0.6) continue
-    const g = pickCare(listGoods(need.type, 1, Number.MAX_SAFE_INTEGER).list, need.stat, max - info[need.stat])
+    if (info[need.stat] / max >= cfg[need.stat] / 100) continue
+    const chosen = { food: cfg.food, clean: cfg.cleanGood, toy: cfg.toy }[need.type]
+    const g = chooseCare(listGoods(need.type, 1, Number.MAX_SAFE_INTEGER).list, need.stat, max - info[need.stat], chosen) ?? restock(need.type, need.stat)
     if (!g) continue
+    logCare(`自己${need.act}：${g.name}`, false)
     if (quiet) useItemQuietly(g)
     else useItem(g, false, `[host]，我可以自己${need.act}哦！~~使用了：${g.name}`)
     return
@@ -427,6 +456,8 @@ function healthRoll(): void {
 function grow(): void {
   if (info.health <= 0 || save.settings.paused) {
     lastTick = null
+    // 贴心宝贝 still watches over a dead pet: its revive lives in careTick, which tick() no longer reaches.
+    if (info.health <= 0 && !save.settings.paused) careTick()
     return
   }
   tick()
